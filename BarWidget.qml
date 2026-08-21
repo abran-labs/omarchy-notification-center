@@ -21,6 +21,7 @@ import qs.Commons
 import qs.Ui
 import "BodyText.js" as BodyText
 import "Sources.js" as Sources
+import "Rules.js" as Rules
 
 BarWidget {
   id: root
@@ -35,23 +36,62 @@ BarWidget {
   readonly property var pendingModel: service ? service.pendingModel : null
   readonly property var pastModel: service ? service.pastModel : null
 
-  readonly property int unreadCount: pendingModel ? pendingModel.count : 0
-  readonly property int seenCount: pastModel ? pastModel.count : 0
-  readonly property int totalCount: unreadCount + seenCount
+  // Counted from the rows this widget actually shows, not from the service's
+  // models, so a hidden sender does not keep the badge lit for a
+  // notification the user has said they never want to see.
+  readonly property int unreadCount: countRows(true)
+  readonly property int seenCount: countRows(false)
+  readonly property int totalCount: rows.length
+
+  function countRows(unread) {
+    var n = 0
+    for (var i = 0; i < root.rows.length; i++) {
+      if (root.rows[i].unread === unread) n++
+    }
+    return n
+  }
 
   readonly property bool dndSupported: !!service
     && typeof service.doNotDisturb === "boolean"
     && typeof service.setDoNotDisturb === "function"
   readonly property bool dnd: dndSupported && service.doNotDisturb
 
-  // Capability probes. The core of this widget needs only what every Omarchy
-  // install ships -- the pending/past models and their dismiss calls. The
-  // per-app rules and deep-linking below rely on service methods that may not
-  // be present, so each is detected rather than assumed, and the controls for
-  // a missing capability are hidden instead of silently doing nothing.
-  readonly property bool canMuteApps: !!service
-    && typeof service.muteFromCenter === "function"
-    && typeof service.unmuteFromCenter === "function"
+  // Per-app rules are owned here rather than by the service, so they work on
+  // a stock Omarchy install. Both are lists of lowercase substrings matched
+  // against a notification's app_name.
+  //
+  //   hidden  -- kept out of this list entirely. The sender still notifies;
+  //              its toast still pops. It just isn't filed here.
+  //   exempt  -- asks the service to keep showing this sender's toasts while
+  //              notifications are silenced. Needs service support, so it is
+  //              capability-gated below.
+  // `settings` is assigned by the bar after this component is constructed,
+  // so this has to re-read on every change rather than being evaluated once.
+  property var hiddenApps: []
+  property var exemptApps: []
+
+  onSettingsChanged: root.loadRules()
+
+  function loadRules() {
+    root.hiddenApps = Rules.list(setting("hiddenApps", []))
+    rebuild()
+  }
+
+  function isHidden(app) { return Rules.matches(root.hiddenApps, app) }
+  function isExempt(app) { return Rules.matches(root.exemptApps, app) }
+
+  // Rules persist onto this widget's own shell.json entry.
+  function saveRule(key, value) {
+    if (!hostShell || typeof hostShell.updateEntryInline !== "function") return
+    var patch = {}
+    patch[key] = value
+    hostShell.updateEntryInline(root.moduleName, patch)
+  }
+
+  // Capability probe. Everything above works on any Omarchy install; letting
+  // a sender through while notifications are silenced is the one rule the
+  // service has to enforce, because the service is what suppresses toasts.
+  // Detected rather than assumed, and its controls hide when unavailable.
   readonly property bool canExemptApps: !!service
     && typeof service.allowThroughDnd === "function"
     && typeof service.denyThroughDnd === "function"
@@ -105,39 +145,47 @@ BarWidget {
     root.menuRow = null
   }
 
+  // Hide a sender from this list. Rules are keyed on the sender's own
+  // app_name, not the pretty source label -- the label is this widget's
+  // invention and would not match anything on the next notification.
   function muteSource(row) {
-    if (!service || !row || typeof service.muteFromCenter !== "function") return
-    // Mute by the sender's own app_name, not the pretty source label: the
-    // label is this widget's invention and means nothing to the service.
-    service.muteFromCenter(row.app)
+    if (!row) return
+    root.saveRule("hiddenApps", Rules.add(root.hiddenApps, row.app))
     root.closeRowMenu()
     rebuild()
   }
 
   function unmuteSource(app) {
-    if (!service || typeof service.unmuteFromCenter !== "function") return
-    service.unmuteFromCenter(app)
+    root.saveRule("hiddenApps", Rules.remove(root.hiddenApps, app))
+    rebuild()
   }
 
   // Senders allowed to keep popping toasts while notifications are silenced.
-  readonly property var alwaysShowApps: service && service.dndAllowlist
-    ? service.dndAllowlist : []
+  // The service owns this one, because the service is what suppresses toasts.
+  readonly property var alwaysShowApps: root.exemptApps
 
   function isAlwaysShown(app) {
-    if (!service || typeof service.isDndAllowed !== "function") return false
+    if (!root.canExemptApps) return false
     return service.isDndAllowed(app)
   }
 
   function toggleAlwaysShow(row) {
-    if (!service || !row) return
+    if (!root.canExemptApps || !row) return
     if (root.isAlwaysShown(row.app)) service.denyThroughDnd(row.app)
     else service.allowThroughDnd(row.app)
+    root.syncExemptApps()
     root.closeRowMenu()
   }
 
   function allowSource(app) {
-    if (!service || typeof service.denyThroughDnd !== "function") return
+    if (!root.canExemptApps) return
     service.denyThroughDnd(app)
+    root.syncExemptApps()
+  }
+
+  function syncExemptApps() {
+    root.exemptApps = root.canExemptApps && service.dndAllowlist
+      ? service.dndAllowlist : []
   }
 
   // ------------------------------------------------------- manage popup
@@ -147,8 +195,7 @@ BarWidget {
   // and irreversible from the UI.
   property bool managePopupOpen: false
 
-  readonly property var mutedApps: service && service.centerMuted
-    ? service.centerMuted : []
+  readonly property var mutedApps: root.hiddenApps
 
   function toggleManagePopup() {
     root.managePopupOpen = !root.managePopupOpen
@@ -225,6 +272,11 @@ BarWidget {
     for (var i = 0; i < model.count; i++) {
       var entry = model.get(i)
       if (!entry) continue
+      // Hidden senders are filtered on the way out rather than being dropped
+      // from the service's models: the service is shared, and its history is
+      // not this widget's to edit. Unhiding a sender brings its existing
+      // notifications straight back.
+      if (root.isHidden(entry.app)) continue
       out.push({
         unread: unread,
         index: i,
@@ -402,10 +454,21 @@ BarWidget {
     onTriggered: root.rebuild()
   }
 
-  Component.onCompleted: rebuild()
+  Component.onCompleted: {
+    loadRules()
+    syncExemptApps()
+  }
 
   // Lets the panel be bound to a key without going through the bar icon:
   //   omarchy-shell notification-center toggle
+  //
+  // Editing this widget's settings drops the IPC target until the shell
+  // restarts: the bar builds the replacement widget before destroying the
+  // outgoing one, so two handlers briefly claim the same name and the
+  // newcomer is refused. That affects Omarchy's own widgets identically
+  // (SystemUpdate.qml logs the same warning), so it is left alone here
+  // rather than worked around with a timer that only narrows the race.
+  // Settings changes are rare; the bar icon never depends on this.
   IpcHandler {
     target: "notification-center"
 
@@ -514,11 +577,9 @@ BarWidget {
       PanelSeparator {
         width: parent.width
         foreground: root.foreground
-        visible: root.canMuteApps
       }
 
       Text {
-        visible: root.canMuteApps
         text: "Never shown"
         color: root.dim
         font.family: root.fontFamily
@@ -527,7 +588,7 @@ BarWidget {
       }
 
       Text {
-        visible: root.canMuteApps && root.mutedApps.length === 0
+        visible: root.mutedApps.length === 0
         text: "Nothing is silenced."
         color: root.faint
         font.family: root.fontFamily
@@ -1036,8 +1097,7 @@ BarWidget {
         // set to never silence isn't offered "never show" -- turn the
         // exemption off first and the option comes back.
         MenuEntry {
-          visible: root.canMuteApps
-            && !root.isAlwaysShown(root.menuRow ? root.menuRow.app : "")
+          visible: !root.isAlwaysShown(root.menuRow ? root.menuRow.app : "")
           label: root.menuRow
             ? "Never show " + root.displayName(root.menuRow) + " again"
             : "Never show again"

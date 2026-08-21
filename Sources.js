@@ -79,11 +79,18 @@ var DEFAULTS = [
   }
 ]
 
+// isArrayLike rather than Array.isArray: values handed in from QML are
+// built in another JavaScript context and fail an isArray check even when
+// they are arrays. See the note in Rules.js.
+function isArrayLike(value) {
+  return !!value && typeof value !== "string" && typeof value.length === "number"
+}
+
 function normalize(entry) {
   if (!entry || typeof entry !== "object") return null
   var match = entry.match
   if (typeof match === "string") match = [match]
-  if (!Array.isArray(match) || match.length === 0) {
+  if (!isArrayLike(match) || match.length === 0) {
     // An entry with nothing to match on can still be useful if it names a
     // key: treat the key itself as the pattern.
     match = entry.key ? [String(entry.key)] : []
@@ -110,7 +117,7 @@ function resolve(userSources) {
   var overrides = {}
   var disabled = {}
 
-  if (Array.isArray(userSources)) {
+  if (isArrayLike(userSources)) {
     for (var i = 0; i < userSources.length; i++) {
       var raw = userSources[i]
       if (!raw || typeof raw !== "object") continue
