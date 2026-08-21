@@ -19,6 +19,7 @@ import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
+import "components"
 import "BodyText.js" as BodyText
 import "Sources.js" as Sources
 import "Rules.js" as Rules
@@ -88,16 +89,146 @@ BarWidget {
     hostShell.updateEntryInline(root.moduleName, patch)
   }
 
-  // Capability probe. Everything above works on any Omarchy install; letting
-  // a sender through while notifications are silenced is the one rule the
-  // service has to enforce, because the service is what suppresses toasts.
-  // Detected rather than assumed, and its controls hide when unavailable.
+  // Capability probe. Letting a sender through while notifications are
+  // silenced is the one rule the service has to enforce, because the service
+  // is what decides whether a toast is shown at all. Detected rather than
+  // assumed, and its controls hide when unavailable.
   readonly property bool canExemptApps: !!service
     && typeof service.allowThroughDnd === "function"
     && typeof service.denyThroughDnd === "function"
     && typeof service.isDndAllowed === "function"
-  readonly property bool canDeepLink: !!service
-    && typeof service.hasDefaultAction === "function"
+
+  // ---------------------------------------------------------------- live
+  //
+  // Behaviour that needs the in-flight notification objects rather than the
+  // plain rows: not treating a timed-out toast as read, dropping a
+  // notification the sender withdrew, and deep-linking into the message.
+  LiveNotifications {
+    id: live
+    service: root.service
+
+    // A toast that expired proves nothing about whether it was seen -- the
+    // common case for a notification center is that nobody was at the desk.
+    // The service files it under "seen" anyway, so move it back.
+    onExpired: function(notificationId) { root.restoreUnread(notificationId) }
+
+    // The sending app retracted it, which is what a chat client does once
+    // the message has been read in-app. Drop it.
+    onWithdrawn: function(notificationId) { root.forget(notificationId) }
+  }
+
+  readonly property bool canDeepLink: live.available
+
+  // Ids waiting to be moved back out of the "seen" bucket.
+  //
+  // The service files an expired toast as seen from inside its own
+  // Qt.callLater, so at the moment `closed` fires the row is still pending
+  // and there is nothing to move yet. Queuing a single callLater behind it
+  // is not enough either -- the two are not ordered. So the id is recorded
+  // and a short-lived timer watches for it to actually land in past.
+  property var restoreQueue: ({})
+
+  function restoreUnread(notificationId) {
+    var queue = root.restoreQueue
+    queue[notificationId] = 0
+    root.restoreQueue = queue
+    restoreTimer.running = true
+  }
+
+  Timer {
+    id: restoreTimer
+    interval: 60
+    repeat: true
+    running: false
+
+    onTriggered: {
+      if (!root.pastModel || !root.pendingModel) { running = false; return }
+
+      var queue = root.restoreQueue
+      var pending = false
+      var changed = false
+
+      for (var key in queue) {
+        var id = Number(key)
+        var moved = false
+
+        for (var i = 0; i < root.pastModel.count; i++) {
+          var row = root.pastModel.get(i)
+          if (!row || row.originalId !== id) continue
+          var snapshot = root.snapshotOf(row)
+          root.pastModel.remove(i)
+          root.pendingModel.insert(0, snapshot)
+          moved = true
+          changed = true
+          break
+        }
+
+        if (moved) {
+          delete queue[key]
+          continue
+        }
+
+        // Give the service a few ticks to file it. If it never shows up the
+        // notification was dismissed rather than archived, and there is
+        // nothing to restore.
+        queue[key] += 1
+        if (queue[key] > 12) delete queue[key]
+        else pending = true
+      }
+
+      root.restoreQueue = queue
+      if (changed) {
+        root.persistModels()
+        root.rebuild()
+      }
+      if (!pending) running = false
+    }
+  }
+
+  function forget(notificationId) {
+    if (!pendingModel || !pastModel) return
+    var models = [pendingModel, pastModel]
+    var removed = false
+    for (var m = 0; m < models.length; m++) {
+      var model = models[m]
+      for (var i = model.count - 1; i >= 0; i--) {
+        var row = model.get(i)
+        if (!row || row.originalId !== notificationId) continue
+        model.remove(i)
+        removed = true
+      }
+    }
+    if (removed) {
+      persistModels()
+      rebuild()
+    }
+  }
+
+  // The service writes its history file on its own edits, so a change made
+  // directly to the models has to ask for the write -- otherwise it is
+  // correct on screen and wrong again after a restart.
+  function persistModels() {
+    if (service && typeof service.scheduleHistorySave === "function")
+      service.scheduleHistorySave()
+  }
+
+  // Copy a ListModel row into a plain object so it can be reinserted into a
+  // different model without carrying a reference to the original.
+  function snapshotOf(row) {
+    return {
+      id: row.id,
+      originalId: row.originalId,
+      app: row.app,
+      appIcon: row.appIcon,
+      summary: row.summary,
+      body: row.body,
+      image: row.image,
+      glyph: row.glyph || "",
+      urgency: row.urgency,
+      expireTimeout: row.expireTimeout || 0,
+      timestamp: row.timestamp
+    }
+  }
 
   function toggleDnd() {
     if (dndSupported) service.setDoNotDisturb(!service.doNotDisturb)
@@ -305,8 +436,11 @@ BarWidget {
   // their bucket + index and we dispatch on that rather than caching handles.
   function dismiss(row, activate) {
     if (!service || !row) return
-    if (row.unread) service.dismissPending(row.index, activate === true)
-    else service.dismissPast(row.index, activate === true)
+    // Fire the sender's deep-link before dropping the row: dismissing
+    // releases the notification, and with it the action.
+    if (activate === true) live.invokeDefault(row.originalId)
+    if (row.unread) service.dismissPending(row.index)
+    else service.dismissPast(row.index)
     rebuild()
   }
 
@@ -342,9 +476,8 @@ BarWidget {
   }
 
   function rowCanDeepLink(row) {
-    if (!service || typeof service.hasDefaultAction !== "function") return false
     if (!row || row.originalId === undefined) return false
-    return service.hasDefaultAction(row.originalId)
+    return live.hasDefaultAction(row.originalId)
   }
 
   readonly property string omarchyPath: Quickshell.env("OMARCHY_PATH")
