@@ -10,6 +10,8 @@
 omarchy plugin add https://github.com/abran-labs/omarchy-notification-center.git --enable
 ```
 
+Lands in the right section of the bar. Drag it wherever you want it.
+
 ## What it does
 
 A toast you were not at your desk for is gone forever. This keeps it, in a list you can act on later.
