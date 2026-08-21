@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "abran-labs.notification-center",
+  "name": "Notification Center",
+  "version": "1.0.0",
+  "author": "abran-labs",
+  "license": "MIT",
+  "description": "Notification center for the Omarchy bar: unread badge, click through to the message, swipe to dismiss, and per-app rules.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Notification Center",
+    "description": "Unread notifications, grouped by sender",
+    "category": "System",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}
