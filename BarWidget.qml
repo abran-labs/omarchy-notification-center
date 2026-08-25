@@ -397,10 +397,25 @@ BarWidget {
   // keyboard navigation and index math trivial; the section header is drawn
   // by the delegate when the bucket changes.
 
+  // Sender-controlled strings are clamped before they enter the widget's own
+  // copy of the row. The service caps how many rows it keeps but not how long
+  // each field is, so a local sender could otherwise park megabytes in the
+  // body of a single notification -- and it persists into history, where the
+  // widget would reload and reprocess it on every rebuild. Limits are far
+  // above anything a real message needs and are applied only to the widget's
+  // display copy; the service's own models are left alone.
+  readonly property int fieldLimit: 2048
+  readonly property int rowLimit: 200
+
+  function clamp(text) {
+    var value = String(text || "")
+    return value.length > fieldLimit ? value.slice(0, fieldLimit) : value
+  }
+
   function rowsFrom(model, unread) {
     var out = []
     if (!model) return out
-    for (var i = 0; i < model.count; i++) {
+    for (var i = 0; i < model.count && out.length < rowLimit; i++) {
       var entry = model.get(i)
       if (!entry) continue
       // Hidden senders are filtered on the way out rather than being dropped
@@ -413,12 +428,12 @@ BarWidget {
         index: i,
         // Handle back to the live notification, for deep-linking.
         originalId: entry.originalId === undefined ? -1 : Number(entry.originalId),
-        app: String(entry.app || "Unknown app"),
-        appIcon: String(entry.appIcon || ""),
-        summary: String(entry.summary || ""),
-        body: String(entry.body || ""),
-        image: String(entry.image || ""),
-        glyph: String(entry.glyph || ""),
+        app: clamp(entry.app || "Unknown app"),
+        appIcon: clamp(entry.appIcon),
+        summary: clamp(entry.summary),
+        body: clamp(entry.body),
+        image: clamp(entry.image),
+        glyph: clamp(entry.glyph),
         urgency: Number(entry.urgency === undefined ? 1 : entry.urgency),
         timestamp: Number(entry.timestamp || 0)
       })
