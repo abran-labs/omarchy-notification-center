@@ -407,6 +407,9 @@ BarWidget {
   readonly property int fieldLimit: 2048
   readonly property int rowLimit: 200
 
+  // Tie-breaker for synthetic ids handed out by the `archive` IPC method.
+  property int archiveSeq: 0
+
   function clamp(text) {
     var value = String(text || "")
     return value.length > fieldLimit ? value.slice(0, fieldLimit) : value
@@ -626,6 +629,35 @@ BarWidget {
     function markAllRead(): void { root.markAllRead() }
     function clear(): void { root.clearAll() }
     function unread(): string { return String(root.unreadCount) }
+    // File a row directly, with no toast. Lets a sender that pops its own
+    // transient toast decide afterwards whether the message deserves to be
+    // kept: acted on -> nothing is stored, ignored -> it lands here unread.
+    // That ordering is impossible through the notification server alone,
+    // which archives every non-transient toast the moment it closes.
+    function archive(app: string, summary: string, body: string, glyph: string): void {
+      if (!pendingModel || !app) return
+      // Ids are negative so they cannot collide with a real notification's
+      // originalId, and a counter breaks ties between two archives landing
+      // in the same millisecond -- duplicate ids are deduped on reload.
+      var stamp = Date.now()
+      root.archiveSeq += 1
+      var syntheticId = -(stamp * 1000 + (root.archiveSeq % 1000))
+      pendingModel.insert(0, {
+        id: syntheticId,
+        originalId: syntheticId,
+        app: clamp(app),
+        appIcon: "",
+        summary: clamp(summary),
+        body: clamp(body),
+        image: "",
+        glyph: clamp(glyph),
+        urgency: 1,
+        expireTimeout: 0,
+        timestamp: stamp
+      })
+      persistModels()
+      rebuild()
+    }
   }
 
   // ------------------------------------------------------------------ bar
