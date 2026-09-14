@@ -1,5 +1,6 @@
 import QtQuick
 import Quickshell.Services.Notifications
+import "../CenterState.js" as CenterState
 
 // Watches the notification service's live objects so the center can behave
 // like an inbox rather than a log of toasts.
@@ -27,14 +28,36 @@ Item {
   property var service: null
 
   signal expired(int notificationId)
-  signal withdrawn(int notificationId)
+  signal withdrawn(int notificationId, string rowKey)
 
   // Ids already connected, so a notification is never wired twice. Values are
   // the objects themselves, to detect an id being reused by a new
   // notification (freedesktop replaces_id) rather than merely re-seen.
   property var watched: ({})
 
+  // Live row key per watched id, captured when the object is first seen
+  // while its popup row is still on screen. Server ids repeat across
+  // generations, so a withdrawal names the exact instance retracted -- but
+  // only when the lookup below found it; a popup removed first (or a toast
+  // that never popped, e.g. DND-silenced) yields "" and the center must not
+  // guess from the id alone.
+  property var keyById: ({})
+
   readonly property bool available: !!service && !!service.liveRefs
+
+  // Key of the on-screen popup row for one live id, or "" when it is not
+  // (or no longer) there.
+  function keyForLive(notificationId) {
+    if (!service || !service.popupModel) return ""
+    var id = Number(notificationId)
+    for (var i = 0; i < service.popupModel.count; i++) {
+      var row = service.popupModel.get(i)
+      if (!row || Number(row.originalId) !== id) continue
+      var entry = CenterState.normalizeEntry(row, 1)
+      if (entry) return CenterState.keyOf(entry)
+    }
+    return ""
+  }
 
   function refresh() {
     if (!available) return
@@ -55,6 +78,12 @@ Item {
   }
 
   function connect(id, notification) {
+    // Capture before wiring: the row is definitely still here now.
+    var liveKey = keyForLive(id)
+    var known = {}
+    for (var k in root.keyById) known[k] = root.keyById[k]
+    known[id] = liveKey
+    root.keyById = known
     try {
       notification.closed.connect(function(reason) {
         var next = {}
@@ -66,8 +95,17 @@ Item {
         }
         root.watched = next
 
+        var rowKey = ""
+        var keys = {}
+        for (var kk in root.keyById) keys[kk] = root.keyById[kk]
+        if (keys[id] !== undefined && root.watched[id] === undefined) {
+          rowKey = keys[id]
+          delete keys[id]
+        }
+        root.keyById = keys
+
         if (reason === NotificationCloseReason.Expired) root.expired(id)
-        else if (reason === NotificationCloseReason.CloseRequested) root.withdrawn(id)
+        else if (reason === NotificationCloseReason.CloseRequested) root.withdrawn(id, rowKey)
         // Dismissed means the user acted on the toast, which the service
         // already handles correctly. Nothing to add.
       })

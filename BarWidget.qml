@@ -1,12 +1,17 @@
 // Notification center: a bell with an unread badge, and a panel listing
 // unread notifications above already-seen ones.
 //
-// Data comes entirely from Omarchy's first-party notification service. That
-// service already keeps the two buckets this UI needs -- `pendingModel`
-// (arrived, not yet seen by the user) and `pastModel` (seen) -- and persists
-// both to disk, so there is no second daemon, no polling, and no separate
-// history file here. Unread/read is the service's own notion of seen, which
-// means opening the panel marks things read exactly the way the toasts do.
+// Data comes from Omarchy's first-party notification service through the
+// ServiceStore adapter (components/ServiceStore.qml). Old services keep the
+// two buckets this UI needs -- `pendingModel` (arrived, not yet seen) and
+// `pastModel` (seen) -- and the store passes those straight through. The
+// current upstream service keeps only `popupModel`; there the store feeds
+// its own fallback models from live popup rows plus a bounded poll of the
+// service's history directory (DND-silenced notifications never pop, so
+// they only ever exist on disk), with read/dismiss state in the widget's
+// own notification-center.json. The service's disk state is never written.
+// Opening the panel marks nothing read on its own; unread is this widget's
+// own notion of seen in fallback, and the service's in native mode.
 //
 // UI conventions follow the first-party panels (audio, bluetooth, network):
 // KeyboardPanel, a hero header, CursorSurface rows whose highlight is driven
@@ -21,12 +26,13 @@ import qs.Commons
 import qs.Ui
 import "components"
 import "BodyText.js" as BodyText
+import "CenterState.js" as CenterState
 import "Sources.js" as Sources
 import "Rules.js" as Rules
 
 BarWidget {
   id: root
-  moduleName: "shavanced.notification-center"
+  moduleName: "abran-labs.notification-center"
 
   // ---------------------------------------------------------------- service
 
@@ -34,8 +40,15 @@ BarWidget {
   readonly property var service: hostShell && hostShell.firstPartyServiceFor
     ? hostShell.firstPartyServiceFor("omarchy.notifications") : null
 
-  readonly property var pendingModel: service ? service.pendingModel : null
-  readonly property var pastModel: service ? service.pastModel : null
+  // Compatibility adapter: native pending/past models when the service has
+  // them, own fallback models fed from popup rows + history dir otherwise.
+  ServiceStore {
+    id: store
+    service: root.service
+  }
+
+  readonly property var pendingModel: store.pendingModel
+  readonly property var pastModel: store.pastModel
 
   // Counted from the rows this widget actually shows, not from the service's
   // models, so a hidden sender does not keep the badge lit for a
@@ -109,12 +122,19 @@ BarWidget {
 
     // A toast that expired proves nothing about whether it was seen -- the
     // common case for a notification center is that nobody was at the desk.
-    // The service files it under "seen" anyway, so move it back.
-    onExpired: function(notificationId) { root.restoreUnread(notificationId) }
+    // Only the old service files that under "seen", so only there is there
+    // anything to move back. In fallback the archived file surfaces as
+    // unread on its own via the next history import.
+    onExpired: function(notificationId) {
+      if (store.hasNativeHistory) root.restoreUnread(notificationId)
+    }
 
     // The sending app retracted it, which is what a chat client does once
-    // the message has been read in-app. Drop it.
-    onWithdrawn: function(notificationId) { root.forget(notificationId) }
+    // the message has been read in-app. Drop it. The key scopes the drop to
+    // the exact instance retracted; "" means its popup row was already gone
+    // (or never popped), and then nothing is dropped rather than guessing
+    // from an id the server may have reused.
+    onWithdrawn: function(notificationId, rowKey) { root.forget(notificationId, rowKey) }
   }
 
   readonly property bool canDeepLink: live.available
@@ -129,6 +149,9 @@ BarWidget {
   property var restoreQueue: ({})
 
   function restoreUnread(notificationId) {
+    // Native-only: only the old service files an expired toast as seen.
+    // Fallback rows default to unread when their history file is imported.
+    if (!store.hasNativeHistory) return
     var queue = root.restoreQueue
     queue[notificationId] = 0
     root.restoreQueue = queue
@@ -185,7 +208,15 @@ BarWidget {
     }
   }
 
-  function forget(notificationId) {
+  function forget(notificationId, rowKey) {
+    // Fallback rows live in the store's own models under tombstone keys;
+    // the service's disk state is never edited. Only a captured live key
+    // drops anything: ids repeat across server generations.
+    if (!store.hasNativeHistory) {
+      if (rowKey) store.dismissKeys([String(rowKey)])
+      rebuild()
+      return
+    }
     if (!pendingModel || !pastModel) return
     var models = [pendingModel, pastModel]
     var removed = false
@@ -204,12 +235,18 @@ BarWidget {
     }
   }
 
-  // The service writes its history file on its own edits, so a change made
-  // directly to the models has to ask for the write -- otherwise it is
-  // correct on screen and wrong again after a restart.
+  // Native services write their history file on their own edits, so a
+  // change made directly to the models has to ask for the write --
+  // otherwise it is correct on screen and wrong again after a restart. In
+  // fallback the service has nothing to persist for us; own state saves
+  // through the store instead.
   function persistModels() {
-    if (service && typeof service.scheduleHistorySave === "function")
-      service.scheduleHistorySave()
+    if (store.hasNativeHistory) {
+      if (service && typeof service.scheduleHistorySave === "function")
+        service.scheduleHistorySave()
+    } else {
+      store.saveSoon()
+    }
   }
 
   // Copy a ListModel row into a plain object so it can be reinserted into a
@@ -429,8 +466,12 @@ BarWidget {
       out.push({
         unread: unread,
         index: i,
+        // Stable identity (timestamp+originalId) for the store's own
+        // read/dismiss state; the bucket index only addresses native models.
+        key: entry.key !== undefined ? String(entry.key) : CenterState.keyOf(entry),
         // Handle back to the live notification, for deep-linking.
         originalId: entry.originalId === undefined ? -1 : Number(entry.originalId),
+        timestamp: Number(entry.timestamp || 0),
         app: clamp(entry.app || "Unknown app"),
         appIcon: clamp(entry.appIcon),
         summary: clamp(entry.summary),
@@ -438,7 +479,6 @@ BarWidget {
         image: clamp(entry.image),
         glyph: clamp(entry.glyph),
         urgency: Number(entry.urgency === undefined ? 1 : entry.urgency),
-        timestamp: Number(entry.timestamp || 0)
       })
     }
     return out
@@ -450,15 +490,33 @@ BarWidget {
     if (root.selectedIndex >= next.length) root.selectedIndex = next.length - 1
   }
 
-  // Dismissing shifts every later index in the same bucket, so rows carry
-  // their bucket + index and we dispatch on that rather than caching handles.
+  // Dismissing shifts every later index in the same bucket, so native rows
+  // carry their bucket + index and we dispatch on that rather than caching
+  // handles. Fallback rows dispatch on their stable key instead, recording
+  // a tombstone -- the service's disk state is never edited -- and taking
+  // a still-visible toast off screen through the service's own dismiss.
   function dismiss(row, activate) {
-    if (!service || !row) return
+    if (!row) return
     // Fire the sender's deep-link before dropping the row: dismissing
-    // releases the notification, and with it the action.
-    if (activate === true) live.invokeDefault(row.originalId)
-    if (row.unread) service.dismissPending(row.index)
-    else service.dismissPast(row.index)
+    // releases the notification, and with it the action. In fallback the
+    // action fires only when the row's exact key is a live, non-restored
+    // popup: persisted history ids collide with newer live rows reusing
+    // them, and invoking by id alone could fire the wrong message's action.
+    if (activate === true) {
+      if (store.hasNativeHistory || liveRowActivatable(row))
+        live.invokeDefault(row.originalId)
+    }
+    if (store.hasNativeHistory) {
+      if (!service) return
+      if (row.unread) service.dismissPending(row.index)
+      else service.dismissPast(row.index)
+    } else {
+      store.dismissKeys([row.key])
+      if (service && typeof service.dismissPopup === "function") {
+        var popupIndex = store.popupIndexForKey(row.key)
+        if (popupIndex >= 0) service.dismissPopup(popupIndex)
+      }
+    }
     rebuild()
   }
 
@@ -495,7 +553,20 @@ BarWidget {
 
   function rowCanDeepLink(row) {
     if (!row || row.originalId === undefined) return false
+    if (!store.hasNativeHistory && !liveRowActivatable(row)) return false
     return live.hasDefaultAction(row.originalId)
+  }
+
+  // True when the row's exact key is a live popup whose actions are safe to
+  // invoke: present on screen now, and not a restored row (a restart carries
+  // an old-generation id the server may since have handed to a fresh,
+  // unrelated notification).
+  function liveRowActivatable(row) {
+    if (!row || !row.key) return false
+    if (store.popupIndexForKey(row.key) < 0) return false
+    var restored = service && service.restoredPopups
+    if (restored && restored[row.key + ".json"]) return false
+    return true
   }
 
   readonly property string omarchyPath: Quickshell.env("OMARCHY_PATH")
@@ -509,6 +580,13 @@ BarWidget {
   }
 
   function clearAll() {
+    // Fallback only tombstones what is shown; on-screen toasts stay put,
+    // matching the service's own `clear`. First-party disk state is untouched.
+    if (!store.hasNativeHistory) {
+      store.clearAll()
+      rebuild()
+      return
+    }
     if (!service) return
     service.clearPending()
     service.clearPast()
@@ -516,8 +594,12 @@ BarWidget {
   }
 
   function markAllRead() {
-    if (!service) return
-    service.markAllSeen()
+    if (store.hasNativeHistory) {
+      if (!service) return
+      service.markAllSeen()
+    } else {
+      store.markAllRead()
+    }
     rebuild()
   }
 
@@ -597,6 +679,13 @@ BarWidget {
     function onCountChanged() { root.rebuild() }
   }
 
+  // Fallback models rebuild in place rather than changing count through the
+  // service, so the store signals explicitly when an import lands.
+  Connections {
+    target: store
+    function onHistoryChanged() { root.rebuild() }
+  }
+
   // Only while open, and only to re-render "3m" -> "4m".
   Timer {
     interval: 30000
@@ -635,14 +724,14 @@ BarWidget {
     // That ordering is impossible through the notification server alone,
     // which archives every non-transient toast the moment it closes.
     function archive(app: string, summary: string, body: string, glyph: string): void {
-      if (!pendingModel || !app) return
+      if (!app) return
       // Ids are negative so they cannot collide with a real notification's
       // originalId, and a counter breaks ties between two archives landing
       // in the same millisecond -- duplicate ids are deduped on reload.
       var stamp = Date.now()
       root.archiveSeq += 1
       var syntheticId = -(stamp * 1000 + (root.archiveSeq % 1000))
-      pendingModel.insert(0, {
+      var entry = {
         id: syntheticId,
         originalId: syntheticId,
         app: clamp(app),
@@ -654,7 +743,16 @@ BarWidget {
         urgency: 1,
         expireTimeout: 0,
         timestamp: stamp
-      })
+      }
+      // Fallback rows persist in own state, capped; the service's disk is
+      // never written.
+      if (!store.hasNativeHistory) {
+        store.archiveRow(entry)
+        rebuild()
+        return
+      }
+      if (!pendingModel) return
+      pendingModel.insert(0, entry)
       persistModels()
       rebuild()
     }
